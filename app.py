@@ -17,12 +17,12 @@ async def convert_text_to_speech(text, voice, rate, volume, pitch):
 
 async def convert_srt_to_timed_speech_with_ffmpeg(srt_content, voice, rate, volume, pitch):
     """
-    Hàm chuyển đổi SRT đã được viết lại hoàn toàn để sử dụng trực tiếp FFmpeg,
-    loại bỏ sự phụ thuộc vào pydub và pyaudioop.
+    Hàm chuyển đổi SRT đã được nâng cấp với cơ chế xử lý lỗi và timeout
+    để tránh bị treo khi gọi FFmpeg.
     """
     subs = pysrt.from_string(srt_content)
     
-    temp_files = [] # Danh sách các file tạm để dọn dẹp sau này
+    temp_files = []
     concat_list_path = "filelist.txt"
     last_end_time_ms = 0
     
@@ -33,15 +33,24 @@ async def convert_srt_to_timed_speech_with_ffmpeg(srt_content, voice, rate, volu
         
         # 1. Tạo khoảng lặng bằng FFmpeg
         silence_duration_ms = start_time_ms - last_end_time_ms
-        if silence_duration_ms > 50: # Chỉ tạo khoảng lặng nếu nó đủ lớn
+        if silence_duration_ms > 50:
             silence_file = f"temp_silence_{i}.mp3"
             duration_sec = silence_duration_ms / 1000.0
-            # Lệnh FFmpeg để tạo file mp3 chứa sự im lặng
             cmd = [
-                'ffmpeg', '-f', 'lavfi', '-i', 'anullsrc=r=24000', 
-                '-t', str(duration_sec), '-q:a', '3', silence_file
+                'ffmpeg', '-f', 'lavfi', '-i', f'anullsrc=r=24000:cl=mono', 
+                '-t', str(duration_sec), '-q:a', '5', '-y', silence_file
             ]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            try:
+                # Nâng cấp: Thêm timeout và ghi log lỗi chi tiết
+                result = subprocess.run(
+                    cmd, check=True, capture_output=True, text=True, timeout=60
+                )
+            except subprocess.TimeoutExpired:
+                st.error(f"Lỗi ở phụ đề {i}: Lệnh FFmpeg để tạo khoảng lặng mất quá nhiều thời gian (> 60s).")
+                raise
+            except subprocess.CalledProcessError as e:
+                st.error(f"Lỗi ở phụ đề {i}: FFmpeg không thể tạo file im lặng. Chi tiết: {e.stderr}")
+                raise
             temp_files.append(silence_file)
 
         # 2. Tạo file âm thanh cho câu thoại
@@ -57,15 +66,26 @@ async def convert_srt_to_timed_speech_with_ffmpeg(srt_content, voice, rate, volu
     # 3. Tạo file danh sách để FFmpeg nối các file lại
     with open(concat_list_path, "w", encoding='utf-8') as f:
         for filename in temp_files:
-            f.write(f"file '{os.path.abspath(filename)}'\n")
+            # Sử dụng đường dẫn tương đối để an toàn hơn
+            f.write(f"file '{filename}'\n")
 
     # 4. Chạy lệnh FFmpeg để nối tất cả các file
     final_output_path = f"timed_output_{int(time.time())}.mp3"
     concat_cmd = [
         'ffmpeg', '-f', 'concat', '-safe', '0', 
-        '-i', concat_list_path, '-c', 'copy', final_output_path
+        '-i', concat_list_path, '-c', 'copy', '-y', final_output_path
     ]
-    subprocess.run(concat_cmd, check=True, capture_output=True, text=True)
+    try:
+        # Nâng cấp: Thêm timeout và ghi log lỗi chi tiết
+        result = subprocess.run(
+            concat_cmd, check=True, capture_output=True, text=True, timeout=180
+        )
+    except subprocess.TimeoutExpired:
+        st.error("Lỗi: Lệnh FFmpeg để nối file mất quá nhiều thời gian (> 3 phút).")
+        raise
+    except subprocess.CalledProcessError as e:
+        st.error(f"Lỗi: FFmpeg không thể nối các file âm thanh. Chi tiết: {e.stderr}")
+        raise
 
     # 5. Dọn dẹp tất cả các file tạm
     for f in temp_files:
@@ -76,13 +96,12 @@ async def convert_srt_to_timed_speech_with_ffmpeg(srt_content, voice, rate, volu
     return final_output_path
 
 
-# --- Giao diện người dùng Streamlit ---
+# --- Giao diện người dùng Streamlit (Giữ nguyên) ---
 
 st.set_page_config(layout="wide")
 st.markdown("<h1 style='text-align: center; color: #3498db;'>CÔNG CỤ TTS BY LÝ VĂN HIỆP</h1>", unsafe_allow_html=True)
 st.markdown("---")
 
-# *** ĐÃ CẬP NHẬT: Thêm lại danh sách giọng đọc đầy đủ ***
 all_voices = [
     # Vietnamese
     { "ShortName": "vi-VN-HoaiMyNeural", "FriendlyName": "HoaiMy", "Locale": "Vietnamese", "Gender": "Female" },
@@ -128,11 +147,10 @@ with col1:
     filtered_voices = [v for v in all_voices if search_term.lower() in str(v).lower()]
     voice_options = {f"{v['FriendlyName']} ({v['Locale']}, {v['Gender']})": v['ShortName'] for v in filtered_voices}
     
-    # Đảm bảo index không bị lỗi nếu không tìm thấy giọng đọc nào
     selectbox_options = list(voice_options.keys())
     selected_voice_display = st.selectbox("Chọn giọng đọc", options=selectbox_options, index=0 if selectbox_options else -1)
     
-    voice_select = voice_options.get(selected_voice_display) # Lấy giá trị an toàn
+    voice_select = voice_options.get(selected_voice_display)
     
     rate_val = st.slider("Tốc độ", -100, 100, 0)
     volume_val = st.slider("Âm lượng", -100, 100, 0)
@@ -155,10 +173,8 @@ with col2:
     
     if st.button("Chuyển đổi thành giọng nói", use_container_width=True, type="primary"):
         if not text_input.strip() or not voice_select:
-            if not text_input.strip():
-                st.error("Vui lòng nhập văn bản hoặc tải lên một file.")
-            if not voice_select:
-                 st.error("Không có giọng đọc nào được chọn. Vui lòng xóa bộ lọc tìm kiếm.")
+            if not text_input.strip(): st.error("Vui lòng nhập văn bản hoặc tải lên một file.")
+            if not voice_select: st.error("Không có giọng đọc nào được chọn. Vui lòng xóa bộ lọc tìm kiếm.")
         else:
             with st.spinner('Đang xử lý, vui lòng chờ...'):
                 try:
@@ -182,4 +198,8 @@ with col2:
                     
                     if os.path.exists(output_file): os.remove(output_file)
                 except Exception as e:
-                    st.error(f"Đã xảy ra lỗi: {e}")
+                    # Hiển thị lỗi một cách thân thiện hơn
+                    if "timed out" in str(e).lower():
+                        st.error(f"Xử lý thất bại: {e}")
+                    else:
+                        st.error(f"Đã xảy ra một lỗi không mong muốn: {e}")
