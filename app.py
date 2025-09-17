@@ -3,185 +3,183 @@ import asyncio
 import time
 import pysrt
 import streamlit as st
-from pydub import AudioSegment
 import edge_tts
+import subprocess # Thư viện để chạy lệnh hệ thống như FFmpeg
 
-# --- Cấu hình FFmpeg ---
-# Streamlit sẽ cài đặt FFmpeg từ file packages.txt
-# Chúng ta không cần chỉ định đường dẫn thủ công nữa.
-
-# --- Các hàm xử lý cốt lõi (giữ nguyên từ file cũ) ---
+# --- Các hàm xử lý cốt lõi ---
 
 async def convert_text_to_speech(text, voice, rate, volume, pitch):
-    """Hàm chuyển đổi văn bản đơn giản."""
+    """Hàm chuyển đổi văn bản đơn giản (không thay đổi)."""
     communicate = edge_tts.Communicate(text, voice, rate=rate, volume=volume, pitch=pitch)
-    # Lưu vào một file tạm thời
     temp_file = f"temp_output_{int(time.time())}.mp3"
     await communicate.save(temp_file)
     return temp_file
 
-async def convert_srt_to_timed_speech(srt_content, voice, rate, volume, pitch):
-    """Hàm chuyển đổi file SRT có đồng bộ hóa thời gian."""
+async def convert_srt_to_timed_speech_with_ffmpeg(srt_content, voice, rate, volume, pitch):
+    """
+    Hàm chuyển đổi SRT đã được viết lại hoàn toàn để sử dụng trực tiếp FFmpeg,
+    loại bỏ sự phụ thuộc vào pydub và pyaudioop.
+    """
     subs = pysrt.from_string(srt_content)
-    final_audio = AudioSegment.silent(duration=0)
+    
+    temp_files = [] # Danh sách các file tạm để dọn dẹp sau này
+    concat_list_path = "filelist.txt"
     last_end_time_ms = 0
     
-    temp_files = [] # Để theo dõi các file tạm
-
-    progress_bar = st.progress(0, text="Đang xử lý phụ đề...")
+    progress_bar = st.progress(0, text="Bắt đầu xử lý phụ đề...")
 
     for i, sub in enumerate(subs):
         start_time_ms = sub.start.ordinal
-        end_time_ms = sub.end.ordinal
+        
+        # 1. Tạo khoảng lặng bằng FFmpeg
+        silence_duration_ms = start_time_ms - last_end_time_ms
+        if silence_duration_ms > 50: # Chỉ tạo khoảng lặng nếu nó đủ lớn
+            silence_file = f"temp_silence_{i}.mp3"
+            duration_sec = silence_duration_ms / 1000.0
+            # Lệnh FFmpeg để tạo file mp3 chứa sự im lặng
+            cmd = [
+                'ffmpeg', '-f', 'lavfi', '-i', 'anullsrc=r=24000', 
+                '-t', str(duration_sec), '-q:a', '3', silence_file
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            temp_files.append(silence_file)
 
-        silence_duration = start_time_ms - last_end_time_ms
-        if silence_duration > 0:
-            final_audio += AudioSegment.silent(duration=silence_duration)
-
-        if not sub.text.strip():
-            last_end_time_ms = end_time_ms
-            continue
-
-        temp_audio_path = f"temp_{sub.index}_{int(time.time())}.mp3"
-        temp_files.append(temp_audio_path)
-        try:
+        # 2. Tạo file âm thanh cho câu thoại
+        if sub.text.strip():
+            speech_file = f"temp_speech_{i}.mp3"
             communicate = edge_tts.Communicate(sub.text, voice, rate=rate, volume=volume, pitch=pitch)
-            await communicate.save(temp_audio_path)
-            
-            segment = AudioSegment.from_mp3(temp_audio_path)
-            final_audio += segment
-            last_end_time_ms = start_time_ms + len(segment)
-        except Exception as e:
-            st.warning(f"Lỗi ở phụ đề {sub.index}: {e}. Bỏ qua...")
-            last_end_time_ms = end_time_ms
+            await communicate.save(speech_file)
+            temp_files.append(speech_file)
+        
+        last_end_time_ms = sub.end.ordinal
+        progress_bar.progress((i + 1) / len(subs), text=f"Đã xử lý phụ đề {i+1}/{len(subs)}")
 
-        # Cập nhật thanh tiến trình
-        progress_bar.progress((i + 1) / len(subs), text=f"Đang xử lý phụ đề {i+1}/{len(subs)}")
+    # 3. Tạo file danh sách để FFmpeg nối các file lại
+    with open(concat_list_path, "w", encoding='utf-8') as f:
+        for filename in temp_files:
+            f.write(f"file '{os.path.abspath(filename)}'\n")
 
-    # Xóa các file tạm
-    for f in temp_files:
-        if os.path.exists(f):
-            os.remove(f)
-
-    # Xuất file cuối cùng
+    # 4. Chạy lệnh FFmpeg để nối tất cả các file
     final_output_path = f"timed_output_{int(time.time())}.mp3"
-    final_audio.export(final_output_path, format="mp3")
-    progress_bar.empty() # Xóa thanh tiến trình
+    concat_cmd = [
+        'ffmpeg', '-f', 'concat', '-safe', '0', 
+        '-i', concat_list_path, '-c', 'copy', final_output_path
+    ]
+    subprocess.run(concat_cmd, check=True, capture_output=True, text=True)
+
+    # 5. Dọn dẹp tất cả các file tạm
+    for f in temp_files:
+        if os.path.exists(f): os.remove(f)
+    if os.path.exists(concat_list_path): os.remove(concat_list_path)
+    
+    progress_bar.empty()
     return final_output_path
+
 
 # --- Giao diện người dùng Streamlit ---
 
 st.set_page_config(layout="wide")
-
 st.markdown("<h1 style='text-align: center; color: #3498db;'>CÔNG CỤ TTS BY LÝ VĂN HIỆP</h1>", unsafe_allow_html=True)
 st.markdown("---")
 
-# Dữ liệu giọng đọc (từ file index.html của bạn)
+# *** ĐÃ CẬP NHẬT: Thêm lại danh sách giọng đọc đầy đủ ***
 all_voices = [
+    # Vietnamese
     { "ShortName": "vi-VN-HoaiMyNeural", "FriendlyName": "HoaiMy", "Locale": "Vietnamese", "Gender": "Female" },
     { "ShortName": "vi-VN-NamMinhNeural", "FriendlyName": "NamMinh", "Locale": "Vietnamese", "Gender": "Male" },
+    # Korean
     { "ShortName": "ko-KR-BongJinNeural", "FriendlyName": "BongJin", "Locale": "Korean", "Gender": "Male" },
     { "ShortName": "ko-KR-GookMinNeural", "FriendlyName": "GookMin", "Locale": "Korean", "Gender": "Male" },
     { "ShortName": "ko-KR-InJoonNeural", "FriendlyName": "InJoon", "Locale": "Korean", "Gender": "Male" },
     { "ShortName": "ko-KR-JiMinNeural", "FriendlyName": "JiMin", "Locale": "Korean", "Gender": "Female" },
     { "ShortName": "ko-KR-SeoHyeonNeural", "FriendlyName": "SeoHyeon", "Locale": "Korean", "Gender": "Female" },
     { "ShortName": "ko-KR-SunHiNeural", "FriendlyName": "SunHi", "Locale": "Korean", "Gender": "Female" },
+    # Japanese
     { "ShortName": "ja-JP-AoiNeural", "FriendlyName": "Aoi", "Locale": "Japanese", "Gender": "Female" },
     { "ShortName": "ja-JP-DaichiNeural", "FriendlyName": "Daichi", "Locale": "Japanese", "Gender": "Male" },
     { "ShortName": "ja-JP-KeitaNeural", "FriendlyName": "Keita", "Locale": "Japanese", "Gender": "Male" },
     { "ShortName": "ja-JP-NanamiNeural", "FriendlyName": "Nanami", "Locale": "Japanese", "Gender": "Female" },
+    # US English
     { "ShortName": "en-US-BrandonNeural", "FriendlyName": "Brandon", "Locale": "English (US)", "Gender": "Male" },
     { "ShortName": "en-US-ChristopherNeural", "FriendlyName": "Christopher", "Locale": "English (US)", "Gender": "Male" },
     { "ShortName": "en-US-CoraNeural", "FriendlyName": "Cora", "Locale": "English (US)", "Gender": "Female" },
-    # Thêm các giọng đọc khác nếu cần
+    { "ShortName": "en-US-DavisNeural", "FriendlyName": "Davis", "Locale": "English (US)", "Gender": "Male" },
+    { "ShortName": "en-US-ElizabethNeural", "FriendlyName": "Elizabeth", "Locale": "English (US)", "Gender": "Female" },
+    { "ShortName": "en-US-EmmaNeural", "FriendlyName": "Emma", "Locale": "English (US)", "Gender": "Female" },
+    { "ShortName": "en-US-EricNeural", "FriendlyName": "Eric", "Locale": "English (US)", "Gender": "Male" },
+    { "ShortName": "en-US-GuyNeural", "FriendlyName": "Guy", "Locale": "English (US)", "Gender": "Male" },
+    { "ShortName": "en-US-JacobNeural", "FriendlyName": "Jacob", "Locale": "English (US)", "Gender": "Male" },
+    { "ShortName": "en-US-JaneNeural", "FriendlyName": "Jane", "Locale": "English (US)", "Gender": "Female" },
+    { "ShortName": "en-US-JasonNeural", "FriendlyName": "Jason", "Locale": "English (US)", "Gender": "Male" },
+    { "ShortName": "en-US-JennyNeural", "FriendlyName": "Jenny", "Locale": "English (US)", "Gender": "Female" },
+    { "ShortName": "en-US-MichelleNeural", "FriendlyName": "Michelle", "Locale": "English (US)", "Gender": "Female" },
+    { "ShortName": "en-US-MonicaNeural", "FriendlyName": "Monica", "Locale": "English (US)", "Gender": "Female" },
+    { "ShortName": "en-US-NancyNeural", "FriendlyName": "Nancy", "Locale": "English (US)", "Gender": "Female" },
+    { "ShortName": "en-US-RogerNeural", "FriendlyName": "Roger", "Locale": "English (US)", "Gender": "Male" },
+    { "ShortName": "en-US-SaraNeural", "FriendlyName": "Sara", "Locale": "English (US)", "Gender": "Female" },
+    { "ShortName": "en-US-SteffanNeural", "FriendlyName": "Steffan", "Locale": "English (US)", "Gender": "Male" },
+    { "ShortName": "en-US-TonyNeural", "FriendlyName": "Tony", "Locale": "English (US)", "Gender": "Male" },
 ]
 
-# Chia layout thành 2 cột
 col1, col2 = st.columns([1, 2])
-
 with col1:
     st.header("Bảng điều khiển ⚙️")
-    
-    # Tìm kiếm và chọn giọng đọc
     search_term = st.text_input("Tìm kiếm giọng đọc (e.g., vi, en-US, female...)", "")
-    
-    filtered_voices = [
-        v for v in all_voices if 
-        search_term.lower() in v['FriendlyName'].lower() or 
-        search_term.lower() in v['Locale'].lower() or
-        search_term.lower() in v['Gender'].lower()
-    ]
-    
+    filtered_voices = [v for v in all_voices if search_term.lower() in str(v).lower()]
     voice_options = {f"{v['FriendlyName']} ({v['Locale']}, {v['Gender']})": v['ShortName'] for v in filtered_voices}
     
-    selected_voice_display = st.selectbox(
-        "Chọn giọng đọc", 
-        options=list(voice_options.keys()),
-        index=0 # Mặc định chọn giọng đầu tiên
-    )
-    voice_select = voice_options[selected_voice_display]
-    st.info(f"Đã tìm thấy {len(filtered_voices)}/{len(all_voices)} giọng đọc.")
-
-    # Các thanh trượt
+    # Đảm bảo index không bị lỗi nếu không tìm thấy giọng đọc nào
+    selectbox_options = list(voice_options.keys())
+    selected_voice_display = st.selectbox("Chọn giọng đọc", options=selectbox_options, index=0 if selectbox_options else -1)
+    
+    voice_select = voice_options.get(selected_voice_display) # Lấy giá trị an toàn
+    
     rate_val = st.slider("Tốc độ", -100, 100, 0)
     volume_val = st.slider("Âm lượng", -100, 100, 0)
     pitch_val = st.slider("Cao độ (Hz)", -50, 50, 0)
     
-    # Định dạng lại giá trị cho edge-tts
     rate = f"{'+' if rate_val >= 0 else ''}{rate_val}%"
     volume = f"{'+' if volume_val >= 0 else ''}{volume_val}%"
     pitch = f"{'+' if pitch_val >= 0 else ''}{pitch_val}Hz"
 
 with col2:
     st.header("Nội dung & Kết quả 📝")
-
     uploaded_file = st.file_uploader("Tải lên file .txt hoặc .srt", type=['txt', 'srt'])
     
-    # Checkbox đồng bộ SRT chỉ hiển thị khi có file .srt được tải lên
     is_srt_timed = False
     if uploaded_file and uploaded_file.name.lower().endswith('.srt'):
         is_srt_timed = st.checkbox("Đồng bộ hóa thời gian file SRT", value=True)
 
     st.divider()
-
-    text_input = st.text_area("Hoặc nhập văn bản vào đây...", height=250, 
-        value=uploaded_file.read().decode('utf-8') if uploaded_file else ""
-    )
+    text_input = st.text_area("Hoặc nhập văn bản vào đây...", height=250, value=uploaded_file.read().decode('utf-8') if uploaded_file else "")
     
     if st.button("Chuyển đổi thành giọng nói", use_container_width=True, type="primary"):
-        if not text_input.strip() and not uploaded_file:
-            st.error("Vui lòng nhập văn bản hoặc tải lên một file.")
+        if not text_input.strip() or not voice_select:
+            if not text_input.strip():
+                st.error("Vui lòng nhập văn bản hoặc tải lên một file.")
+            if not voice_select:
+                 st.error("Không có giọng đọc nào được chọn. Vui lòng xóa bộ lọc tìm kiếm.")
         else:
-            final_text = text_input
-            
             with st.spinner('Đang xử lý, vui lòng chờ...'):
                 try:
                     output_file = None
-                    # Xử lý SRT có đồng bộ
                     if uploaded_file and uploaded_file.name.lower().endswith('.srt') and is_srt_timed:
-                         srt_content = final_text
-                         output_file = asyncio.run(convert_srt_to_timed_speech(srt_content, voice_select, rate, volume, pitch))
-                    # Xử lý văn bản thường hoặc SRT không đồng bộ
+                         srt_content = text_input
+                         output_file = asyncio.run(convert_srt_to_timed_speech_with_ffmpeg(srt_content, voice_select, rate, volume, pitch))
                     else:
-                        output_file = asyncio.run(convert_text_to_speech(final_text, voice_select, rate, volume, pitch))
+                        output_file = asyncio.run(convert_text_to_speech(text_input, voice_select, rate, volume, pitch))
 
                     st.success("Hoàn tất! ✅")
+                    with open(output_file, 'rb') as audio_file:
+                        audio_bytes = audio_file.read()
+                        st.audio(audio_bytes, format='audio/mpeg')
+                        st.download_button(
+                            label="Tải xuống file MP3",
+                            data=audio_bytes,
+                            file_name=os.path.basename(output_file),
+                            mime='audio/mpeg'
+                        )
                     
-                    # Hiển thị trình phát và nút tải xuống
-                    audio_file = open(output_file, 'rb')
-                    audio_bytes = audio_file.read()
-                    st.audio(audio_bytes, format='audio/mpeg')
-                    
-                    st.download_button(
-                        label="Tải xuống file MP3",
-                        data=audio_bytes,
-                        file_name=os.path.basename(output_file),
-                        mime='audio/mpeg'
-                    )
-                    
-                    # Dọn dẹp file đã tạo
-                    if os.path.exists(output_file):
-                        os.remove(output_file)
-
+                    if os.path.exists(output_file): os.remove(output_file)
                 except Exception as e:
                     st.error(f"Đã xảy ra lỗi: {e}")
